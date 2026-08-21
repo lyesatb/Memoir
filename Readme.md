@@ -40,7 +40,6 @@ Le projet vise à concevoir un scoring automatique de la qualité visuelle des a
 Le dépôt contient **deux implémentations** du même pipeline :
 
 - **`jcdecaux_project/`** — version opérationnelle : données réelles, modèle entraîné (`artifacts/best_model.pth`), encodeurs sauvegardés, pipeline robuste + OCR + détection de logo (v2, voir §2.1).
-- **`projet_bien_structurer/`** — application utilisateur en cours de développement séparément (hors périmètre de cette analyse).
 
 ### 2.1 Pipeline réel (v2 — après robustesse + OCR + logo)
 
@@ -170,5 +169,5 @@ jcdecaux_project/
 ├── api/main.py                # API FastAPI /predict (non utilisée par l'app Streamlit)
 └── artifacts/                # best_model.pth, encoders.pkl, class_weights.pkl, logo_reference.pkl
 
-projet_bien_structurer/       # squelette initial, non connecté aux données (app finale = app.py ci-dessus)
+
 ```
