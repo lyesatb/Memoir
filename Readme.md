@@ -1,4 +1,4 @@
-# Analyse du projet — Base de travail pour la rédaction du mémoire
+# Analyse du projet
 
 **Sujet** : Vers une IA d'évaluation qualitative des visuels publicitaires : analyse d'image, style, contraste et visibilité
 **Auteur** : AIT TAYEB Lyes
