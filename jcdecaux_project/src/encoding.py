@@ -1,226 +1,108 @@
-# src/train.py
-import os
-import time
-from pathlib import Path
-import pickle
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
+"""Encodage des attributs cibles pour l'entraînement multi-tâches.
 
-import torch
-import torch.nn.functional as F
-from torch import optim
+Ce module :
+  1. détermine les colonnes cibles (tous les attributs qualité, hors
+     métadonnées et hors colonnes exclues comme "Notoriété (base YouGov)") ;
+  2. fusionne les classes rares (< RARE_CLASS_MIN occurrences) dans une
+     catégorie "Autre" par colonne, pour limiter le surapprentissage sur
+     des classes à quelques exemplaires seulement ;
+  3. encode chaque colonne cible avec un LabelEncoder ;
+  4. calcule des poids de classe (inverse-fréquence) par tâche, utilisés
+     par l'entraînement pour compenser le déséquilibre ;
+  5. sauvegarde le DataFrame encodé et tous les artefacts sur disque, afin
+     que train.py / evaluate.py les rechargent sans dépendre d'un ordre
+     d'import particulier.
+"""
+import pickle
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
 
 from config.config import (
-    DEVICE, BACKBONE, EPOCHS, MODEL_PATH, ARTIFACTS_DIR,
-    IMG_SIZE, BATCH_SIZE, WEIGHT_DECAY, LR, PATIENCE
+    OUTPUT_DIR, ARTIFACTS_DIR, ENCODERS_PATH, ENCODERS_XLSX,
+    CLASS_WEIGHTS_PATH, METADATA_COLS, EXCLUDED_TARGET_COLS,
+    RARE_CLASS_MIN, RARE_CLASS_LABEL,
 )
-from src.model import MultiTaskModel
-from src.dataset import build_dataloaders
-from src.excel_matching import df_labeled
-from src.encoding import encoders, col_types, target_cols
+from src.excel_matching import df_labeled as _df_labeled
 
-# Output folders
-LOGS_DIR = Path("outputs/logs")
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-ARTIFACTS_DIR = Path(ARTIFACTS_DIR) if isinstance(ARTIFACTS_DIR, (str, Path)) else Path("artifacts")
-ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+NA_LABEL = "Non renseigné"
 
-# Utility: save history
-def save_history(history, path=LOGS_DIR / "training_history.csv"):
-    df = pd.DataFrame(history)
-    df.to_csv(path, index=False)
-    print("Training history saved to", path)
 
-# Build dataloaders from df_labeled (df_labeled comes from src.excel_matching)
-print("Building dataloaders...")
-train_loader, val_loader, test_loader = build_dataloaders(df_labeled, target_cols, col_types)
+def get_target_cols(df):
+    return [c for c in df.columns if c not in METADATA_COLS and c not in EXCLUDED_TARGET_COLS]
 
-# Instantiate model
-print("Instantiating model...")
-model = MultiTaskModel(BACKBONE, target_cols, col_types, encoders).to(DEVICE)
 
-# Loss functions per task (robuste)
-loss_fns = {}
-for c in target_cols:
-    ttype = col_types.get(c, "categorical")
-    if ttype == "categorical":
-        loss_fns[c] = torch.nn.CrossEntropyLoss(reduction="mean")
-    elif ttype == "binary":
-        loss_fns[c] = torch.nn.BCEWithLogitsLoss(reduction="mean")
-    else:
-        loss_fns[c] = torch.nn.MSELoss(reduction="mean")
+def clean_column(series):
+    return series.fillna(NA_LABEL).astype(str).str.strip().replace("", NA_LABEL)
 
-# Optimizer and scheduler
-optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5, verbose=True)
 
-# Debug / sanity check on first batch: shapes, dtypes, ranges
-def sanity_check_first_batch():
-    print("Running sanity check on first batch...")
-    batch = next(iter(train_loader))
-    imgs, targets, paths = batch
-    print(" imgs.shape:", imgs.shape, "dtype:", imgs.dtype)
-    print(" example paths:", paths[:3])
+def merge_rare_classes(series, min_count=RARE_CLASS_MIN, rare_label=RARE_CLASS_LABEL):
+    counts = series.value_counts()
+    rare = counts[counts < min_count].index
+    # Ne fusionne pas si ça ne laisse qu'une seule classe restante.
+    if len(rare) == 0 or len(counts) - len(rare) < 2:
+        return series, 0
+    merged = series.where(~series.isin(rare), rare_label)
+    return merged, len(rare)
+
+
+def build_encoding(df_labeled):
+    df = df_labeled.copy().reset_index(drop=True)
+    target_cols = get_target_cols(df)
+
+    encoders = {}
+    col_types = {}
+    class_weights = {}
+    merge_report = []
+
     for c in target_cols:
-        t = targets[c]
-        print(f" target '{c}': shape={t.shape}, dtype={t.dtype}, min={t.min().item()}, max={t.max().item()}, unique_sample={np.unique(t.cpu().numpy())[:10]}")
-    # forward pass shapes
-    model.eval()
-    with torch.no_grad():
-        imgs_dev = imgs.to(DEVICE)
-        outputs = model(imgs_dev)
-    for c, out in outputs.items():
-        print(f" output '{c}': shape={out.shape}, dtype={out.dtype}, min={float(out.min()):.4f}, max={float(out.max()):.4f}")
-    print("Sanity check done.\n")
+        cleaned = clean_column(df[c])
+        merged, n_rare = merge_rare_classes(cleaned)
+        if n_rare:
+            merge_report.append((c, n_rare, cleaned.nunique(), merged.nunique()))
 
-# Run sanity check once
-try:
-    sanity_check_first_batch()
-except Exception as e:
-    print("Sanity check failed. Inspect shapes/types above. Error:", e)
-    raise
+        enc = LabelEncoder()
+        df[c + "_enc"] = enc.fit_transform(merged)
+        encoders[c] = enc
+        col_types[c] = "categorical"
 
-# Training loop with robust loss handling and logging per task
-best_val = float("inf")
-no_improve = 0
-history = []
+        counts = np.bincount(df[c + "_enc"].values, minlength=len(enc.classes_)).astype(float)
+        counts[counts == 0] = 1.0
+        weights = counts.sum() / (counts * len(counts))
+        class_weights[c] = weights.tolist()
 
-print("Starting training loop...")
-for epoch in range(1, EPOCHS + 1):
-    t0 = time.time()
-    model.train()
-    train_epoch_loss = 0.0
-    train_task_loss_acc = {c: 0.0 for c in target_cols}
-    n_batches = 0
+    return df, target_cols, encoders, col_types, class_weights, merge_report
 
-    pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}", leave=False)
-    for imgs, targets, _ in pbar:
-        imgs = imgs.to(DEVICE)
-        # cast and move targets safely
-        for c in target_cols:
-            if col_types[c] == "categorical":
-                targets[c] = targets[c].long().to(DEVICE)
-            else:
-                targets[c] = targets[c].float().to(DEVICE)
 
-        optimizer.zero_grad()
-        outputs = model(imgs)
+def save_artifacts(df, target_cols, encoders, col_types, class_weights):
+    with open(ENCODERS_PATH, "wb") as f:
+        pickle.dump({"encoders": encoders, "col_types": col_types, "target_cols": target_cols}, f)
 
-        # compute per-task losses
-        task_losses = []
-        task_losses_values = {}
-        for c in target_cols:
-            out = outputs[c]
-            ttype = col_types[c]
+    with open(CLASS_WEIGHTS_PATH, "wb") as f:
+        pickle.dump(class_weights, f)
 
-            # Ensure shapes are compatible
-            if ttype == "categorical":
-                # out expected shape: (B, C)
-                if out.dim() == 1:
-                    out = out.unsqueeze(0)
-                # targets shape: (B,)
-                loss_val = loss_fns[c](out, targets[c])
-            elif ttype == "binary":
-                # out can be (B,1) or (B,)
-                if out.dim() == 2 and out.size(1) == 1:
-                    out_flat = out.view(-1)
-                else:
-                    out_flat = out.view(-1)
-                loss_val = loss_fns[c](out_flat, targets[c].view(-1))
-            else:  # numeric / regression
-                loss_val = loss_fns[c](out.view(-1), targets[c].view(-1))
+    rows = []
+    for c, enc in encoders.items():
+        for label, class_id in zip(enc.classes_, range(len(enc.classes_))):
+            rows.append({"column": c, "label": label, "class_id": class_id})
+    pd.DataFrame(rows).to_excel(ENCODERS_XLSX, index=False)
 
-            task_losses.append(loss_val)
-            task_losses_values[c] = float(loss_val.detach().cpu().item())
+    out_path = OUTPUT_DIR / "df_labeled_with_enc.csv"
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path
 
-        # average across tasks to avoid huge sums
-        loss = torch.stack(task_losses).mean()
-        loss.backward()
-        optimizer.step()
 
-        train_epoch_loss += float(loss.detach().cpu().item())
-        for c in target_cols:
-            train_task_loss_acc[c] += task_losses_values[c]
-        n_batches += 1
+# Exécuté à l'import, même convention que src/excel_matching.py : les
+# modules qui en dépendent (train.py, evaluate.py) relisent ensuite les
+# artefacts sur disque plutôt que de dépendre de l'ordre des imports.
+df_encoded, target_cols, encoders, col_types, class_weights, merge_report = build_encoding(_df_labeled)
+out_path = save_artifacts(df_encoded, target_cols, encoders, col_types, class_weights)
 
-        pbar.set_postfix({"loss": f"{train_epoch_loss / n_batches:.4f}"})
-
-    avg_train_loss = train_epoch_loss / max(1, n_batches)
-    avg_task_train = {c: train_task_loss_acc[c] / max(1, n_batches) for c in target_cols}
-
-    # Validation
-    model.eval()
-    val_epoch_loss = 0.0
-    val_task_loss_acc = {c: 0.0 for c in target_cols}
-    n_val_batches = 0
-    with torch.no_grad():
-        for imgs, targets, _ in val_loader:
-            imgs = imgs.to(DEVICE)
-            for c in target_cols:
-                if col_types[c] == "categorical":
-                    targets[c] = targets[c].long().to(DEVICE)
-                else:
-                    targets[c] = targets[c].float().to(DEVICE)
-
-            outputs = model(imgs)
-            task_losses = []
-            for c in target_cols:
-                out = outputs[c]
-                ttype = col_types[c]
-                if ttype == "categorical":
-                    if out.dim() == 1:
-                        out = out.unsqueeze(0)
-                    loss_val = loss_fns[c](out, targets[c])
-                elif ttype == "binary":
-                    if out.dim() == 2 and out.size(1) == 1:
-                        out_flat = out.view(-1)
-                    else:
-                        out_flat = out.view(-1)
-                    loss_val = loss_fns[c](out_flat, targets[c].view(-1))
-                else:
-                    loss_val = loss_fns[c](out.view(-1), targets[c].view(-1))
-                task_losses.append(loss_val)
-                val_task_loss_acc[c] += float(loss_val.detach().cpu().item())
-
-            loss_val_batch = torch.stack(task_losses).mean()
-            val_epoch_loss += float(loss_val_batch.detach().cpu().item())
-            n_val_batches += 1
-
-    avg_val_loss = val_epoch_loss / max(1, n_val_batches)
-    avg_task_val = {c: val_task_loss_acc[c] / max(1, n_val_batches) for c in target_cols}
-
-    # Scheduler step
-    scheduler.step(avg_val_loss)
-
-    elapsed = time.time() - t0
-    print(f"Epoch {epoch}/{EPOCHS} — train_loss: {avg_train_loss:.4f} — val_loss: {avg_val_loss:.4f} — time: {elapsed:.1f}s")
-    # Print per-task summary (concise)
-    per_task_str = " | ".join([f"{c}: train={avg_task_train[c]:.4f} val={avg_task_val[c]:.4f}" for c in target_cols])
-    print(" Per-task losses:", per_task_str)
-
-    # Save history
-    history.append({
-        "epoch": epoch,
-        "train_loss": avg_train_loss,
-        "val_loss": avg_val_loss,
-        **{f"train_{c}": avg_task_train[c] for c in target_cols},
-        **{f"val_{c}": avg_task_val[c] for c in target_cols}
-    })
-    save_history(history)
-
-    # Early stopping & save best
-    if avg_val_loss < best_val:
-        best_val = avg_val_loss
-        no_improve = 0
-        torch.save({"model_state": model.state_dict(), "epoch": epoch}, str(MODEL_PATH))
-        print(" New best model saved to", MODEL_PATH)
-    else:
-        no_improve += 1
-        print(f" No improvement for {no_improve} epoch(s).")
-        if no_improve >= PATIENCE:
-            print("Early stopping triggered. Stopping training.")
-            break
-
-print("Training finished. Best val loss:", best_val)
-save_history(history)
+print(f"Encodage terminé : {len(target_cols)} colonnes cibles.")
+if merge_report:
+    print(f"Fusion des classes rares (< {RARE_CLASS_MIN} occurrences) :")
+    for c, n_rare, before, after in merge_report:
+        print(f"  - {c}: {n_rare} classe(s) rare(s) fusionnée(s) ({before} -> {after} classes)")
+print(f"DataFrame encodé sauvegardé dans {out_path}")
+print(f"Encodeurs sauvegardés dans {ENCODERS_PATH}")

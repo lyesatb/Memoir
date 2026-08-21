@@ -3,13 +3,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from pathlib import Path
-from PIL import Image
 import numpy as np
 
 from config.config import (
     IMG_SIZE, BATCH_SIZE, DEVICE, NUM_WORKERS,
     SPLIT, USE_WEIGHTED_SAMPLER, SAMPLER_TARGET
 )
+from src.img_utils import safe_open_rgb
 
 class MultiTaskDataset(Dataset):
     def __init__(self, df, target_cols, col_types, transforms=None):
@@ -24,7 +24,7 @@ class MultiTaskDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_path = row["image_path"]
-        img = Image.open(img_path).convert("RGB")
+        img = safe_open_rgb(img_path)
 
         if self.transforms:
             img = self.transforms(img)

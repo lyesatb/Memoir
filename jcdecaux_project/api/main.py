@@ -16,7 +16,8 @@ model = MultiTaskModel(
     data["col_types"],
     data["encoders"]
 )
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+model.load_state_dict(ckpt["model_state"] if "model_state" in ckpt else ckpt)
 model.to(DEVICE).eval()
 
 tf = transforms.Compose([
